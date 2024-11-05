@@ -11,6 +11,7 @@ module.exports = class Scheduler {
         this.customersInQueue = [];
         this.customerQueueOffset = 0;
         this.taskQueueByCustomer = new Map();
+        this.runningTaskCountByCustomer = new Map();
     }
 
     execute(task) {
@@ -53,8 +54,21 @@ module.exports = class Scheduler {
     }
 
     executeUsing(worker, task) {
+        const { customerId } = task;
+        this.runningTaskCountByCustomer.set(
+            customerId,
+            (this.runningTaskCountByCustomer.get(customerId) ?? 0) + 1,
+        );
         worker.execute(task).then(
             () => {
+                const customerTaskCount = this.runningTaskCountByCustomer.get(customerId);
+                if (customerTaskCount === 0) {
+                    throw new Error('Customer task counter de-sync');
+                } else if (customerTaskCount === 1) {
+                    this.runningTaskCountByCustomer.delete(customerId);
+                } else {
+                    this.runningTaskCountByCustomer.set(customerId, customerTaskCount - 1);
+                }
                 this.tick(worker);
             },
             console.error
@@ -80,18 +94,34 @@ module.exports = class Scheduler {
     pickNextTask() {
         if (this.customersInQueue.length === 0) return null;
 
-        const nextQueueOffset = this.customerQueueOffset;
-        const customerId = this.customersInQueue[nextQueueOffset];
+        let nextCustomerId = this.customersInQueue[this.customerQueueOffset];
+        let nextCustomerRunningTasks = this.runningTaskCountByCustomer.get(nextCustomerId) ?? 0;
 
-        const customerQueue = this.taskQueueByCustomer.get(customerId);
+        for (let offset = 1; offset < this.customersInQueue.length; offset += 1) {
+            const customerId = this.customersInQueue[
+                (this.customerQueueOffset + offset) % this.customersInQueue.length
+            ];
+            const runningTasks = (this.runningTaskCountByCustomer.get(customerId) ?? 0);
+
+            if (runningTasks < nextCustomerRunningTasks) {
+                nextCustomerId = customerId;
+                nextCustomerRunningTasks = runningTasks;
+            }
+        }
+        // Comment-out loop above and then uncomment this log to see how unfair first algorithm is
+        // It should be less fair for customers with id >= 8000 as they have long-running tasks
+        // console.log('nextCustomerRunningTasks', nextCustomerRunningTasks);
+
+        const customerQueue = this.taskQueueByCustomer.get(nextCustomerId);
         if (customerQueue === undefined || customerQueue.length <= 0) {
             throw new Error('Customer queue is empty, but customer is still registered in the offset');
         }
 
         const customerTask = customerQueue.shift();
         if (customerQueue.length <= 0) {
-            this.taskQueueByCustomer.delete(customerId);
-            this.customersInQueue.splice(nextQueueOffset, 1);
+            this.taskQueueByCustomer.delete(nextCustomerId);
+            const offset = this.customersInQueue.findIndex((t) => t === nextCustomerId);
+            this.customersInQueue.splice(offset, 1);
         }
 
         if (this.customersInQueue.length !== 0) {
